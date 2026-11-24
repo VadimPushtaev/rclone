@@ -703,7 +703,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	if f.quirks.binlist {
 		entries, err = f.listBin(ctx, f.absPath(dir), 1)
 	} else {
-		entries, err = f.listM1(ctx, f.absPath(dir), 0, maxInt32)
+		entries, err = f.listM1(ctx, f.absPath(dir))
 	}
 
 	if err == nil && f.ci.LogLevel >= fs.LogLevelDebug {
@@ -718,8 +718,58 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return
 }
 
-// list using protocol "m1"
-func (f *Fs) listM1(ctx context.Context, dirPath string, offset int, limit int) (entries fs.DirEntries, err error) {
+// listM1 lists all pages of a directory using protocol "m1".
+func (f *Fs) listM1(ctx context.Context, dirPath string) (fs.DirEntries, error) {
+	var entries fs.DirEntries
+	var total int
+	var seen map[string]struct{}
+	for offset := 0; ; {
+		info, err := f.listM1Page(ctx, dirPath, offset)
+		if err != nil {
+			if offset != 0 {
+				return nil, fmt.Errorf("listing %q at offset %d: %w", dirPath, offset, err)
+			}
+			if apiErr, ok := err.(*api.FileErrorResponse); ok && apiErr.Status == 404 {
+				return nil, fs.ErrorDirNotFound
+			}
+			return nil, err
+		}
+
+		items := info.Body.List
+		if offset == 0 {
+			total = info.Body.Count.Files + info.Body.Count.Folders
+			if len(items) < total {
+				seen = make(map[string]struct{})
+			}
+		}
+		if len(items) == 0 && offset < total {
+			return nil, fmt.Errorf("listing %q at offset %d: empty page before all %d entries were listed", dirPath, offset, total)
+		}
+		for _, item := range items {
+			if seen != nil {
+				if _, ok := seen[item.Home]; ok {
+					return nil, fmt.Errorf("listing %q at offset %d: repeated entry %q", dirPath, offset, item.Home)
+				}
+				seen[item.Home] = struct{}{}
+			}
+			entry, _, err := f.itemToDirEntry(ctx, &item)
+			if err == nil {
+				entries = append(entries, entry)
+			} else {
+				fs.Debugf(f, "Excluding path %q from list: %v", item.Home, err)
+			}
+		}
+
+		// The API offset includes items skipped during conversion.
+		offset += len(items)
+		if offset >= total {
+			return entries, nil
+		}
+	}
+}
+
+// listM1Page fetches one page of a directory listing.
+func (f *Fs) listM1Page(ctx context.Context, dirPath string, offset int) (*api.FolderInfoResponse, error) {
 	token, err := f.accessToken()
 	if err != nil {
 		return nil, err
@@ -728,33 +778,27 @@ func (f *Fs) listM1(ctx context.Context, dirPath string, offset int, limit int) 
 	params := url.Values{}
 	params.Set("access_token", token)
 	params.Set("offset", strconv.Itoa(offset))
-	params.Set("limit", strconv.Itoa(limit))
+	params.Set("limit", strconv.Itoa(maxInt32))
 
 	data := url.Values{}
 	data.Set("home", f.opt.Enc.FromStandardPath(dirPath))
+	body := data.Encode()
 
 	opts := rest.Opts{
 		Method:      "POST",
 		Path:        "/api/m1/folder",
 		Parameters:  params,
-		Body:        strings.NewReader(data.Encode()),
 		ContentType: api.BinContentType,
 	}
 
-	var (
-		info api.FolderInfoResponse
-		res  *http.Response
-	)
+	var info api.FolderInfoResponse
 	err = f.pacer.Call(func() (bool, error) {
-		res, err = f.srv.CallJSON(ctx, &opts, nil, &info)
+		opts.Body = strings.NewReader(body)
+		res, err := f.srv.CallJSON(ctx, &opts, nil, &info)
 		return shouldRetry(ctx, res, err, f, &opts)
 	})
 
 	if err != nil {
-		apiErr, ok := err.(*api.FileErrorResponse)
-		if ok && apiErr.Status == 404 {
-			return nil, fs.ErrorDirNotFound
-		}
 		return nil, err
 	}
 
@@ -765,16 +809,7 @@ func (f *Fs) listM1(ctx context.Context, dirPath string, offset int, limit int) 
 	if !isDir {
 		return nil, fs.ErrorIsFile
 	}
-
-	for _, item := range info.Body.List {
-		entry, _, err := f.itemToDirEntry(ctx, &item)
-		if err == nil {
-			entries = append(entries, entry)
-		} else {
-			fs.Debugf(f, "Excluding path %q from list: %v", item.Home, err)
-		}
-	}
-	return entries, nil
+	return &info, nil
 }
 
 // list using protocol "bin"
